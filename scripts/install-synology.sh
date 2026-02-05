@@ -218,6 +218,9 @@ SIGNUPS_ALLOWED=true
 ## Invitation settings
 # INVITATIONS_ALLOWED=true
 
+## Timezone (detected from host)
+TIMEZONE=$(cat /etc/timezone 2>/dev/null || echo "UTC")
+
 ## Logging
 LOG_FILE=/data/vaultwarden.log
 LOG_LEVEL=info
@@ -259,13 +262,13 @@ services:
     ports:
       - "${port}:80"
     environment:
-      - TZ=$(cat /etc/timezone 2>/dev/null || echo "UTC")
+      - TZ=${TIMEZONE:-UTC}
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:80/alive"]
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:80/alive || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 40s
 EOF
 
     chmod 644 "$compose_file"
@@ -340,11 +343,36 @@ verify_installation() {
 
     log_info "Verifying installation..."
 
+    # Determine which HTTP client to use
+    local http_client=""
+    if command -v curl &> /dev/null; then
+        http_client="curl"
+    elif command -v wget &> /dev/null; then
+        http_client="wget"
+    else
+        log_warning "Neither curl nor wget found. Skipping health check verification."
+        log_info "You can manually verify by accessing: http://localhost:${port}"
+        return 0
+    fi
+
     while [ $attempt -le $max_attempts ]; do
-        if curl -sf "http://localhost:${port}/alive" > /dev/null 2>&1; then
+        local health_check_passed=false
+
+        if [ "$http_client" = "curl" ]; then
+            if curl -sf "http://localhost:${port}/alive" > /dev/null 2>&1; then
+                health_check_passed=true
+            fi
+        else
+            if wget -q --spider "http://localhost:${port}/alive" 2>/dev/null; then
+                health_check_passed=true
+            fi
+        fi
+
+        if [ "$health_check_passed" = true ]; then
             log_success "Vaultwarden is running and healthy!"
             return 0
         fi
+
         log_info "Waiting for Vaultwarden to start (attempt $attempt/$max_attempts)..."
         sleep 2
         attempt=$((attempt + 1))
@@ -362,13 +390,25 @@ print_instructions() {
     local data_dir="$3"
     local admin_token="$4"
 
+    # Try to detect local IP address with multiple fallback methods
+    local local_ip=""
+    if command -v hostname &> /dev/null && hostname -I &> /dev/null; then
+        local_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    elif command -v ip &> /dev/null; then
+        local_ip=$(ip route get 1 2>/dev/null | awk '{print $7; exit}')
+    elif [ -f /etc/synoinfo.conf ]; then
+        # Fallback for Synology: try to get IP from network interface
+        local_ip=$(ip addr show eth0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d'/' -f1)
+    fi
+    local_ip="${local_ip:-<your-nas-ip>}"
+
     echo ""
     echo "=========================================="
     echo -e "${GREEN}Vaultwarden Installation Complete!${NC}"
     echo "=========================================="
     echo ""
     echo "Access your Vaultwarden instance:"
-    echo "  Local:  http://$(hostname -I 2>/dev/null | awk '{print $1}' || echo 'your-nas-ip'):${port}"
+    echo "  Local:  http://${local_ip}:${port}"
     if [ -n "$domain" ] && [ "$domain" != "https://vw.example.com" ]; then
         echo "  Domain: ${domain}"
     fi
